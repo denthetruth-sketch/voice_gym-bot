@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 
+# ---------------- LOAD ENV ----------------
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -23,41 +25,33 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
 
 # ---------------- STATE ----------------
+
 workouts = {}
 
 
-# ---------------- START ----------------
+# ---------------- INTENT LAYER ----------------
 
-@dp.message(CommandStart())
-async def start_handler(message: Message):
-    await message.answer(
-        "🏋️ Voice Gym Bot\n\n"
-        "🎤 Команды:\n"
-        "• начать / старт / начать тренировку\n"
-        "• конец / финиш / конец тренировки\n"
-        "• отмена / удалить / назад\n\n"
-        "🎤 Примеры упражнений:\n"
-        "• жим 60 кг 10\n"
-        "• пресс 15\n"
-        "• 10 (добавится к последнему упражнению)\n\n"
-        "📄 После 'конец' будет PDF"
-    )
-
-
-# ---------------- COMMAND NORMALIZER ----------------
-
-def normalize_command(text: str):
+def detect_intent(text: str):
     text = text.lower().strip()
 
-    start_cmds = ["start", "начать", "начать тренировку", "старт"]
-    finish_cmds = ["finish", "конец", "конец тренировки", "финиш", "закончить", "закончить тренировку"]
-    undo_cmds = ["undo", "отмена", "удалить", "назад"]
+    start_cmds = [
+        "start", "начать", "начать тренировку", "старт",
+        "поехали", "погнали", "let's go", "go", "начинаем"
+    ]
+
+    finish_cmds = [
+        "finish", "конец", "конец тренировки", "финиш",
+        "закончить", "закончить тренировку", "стоп", "stop"
+    ]
+
+    undo_cmds = [
+        "undo", "отмена", "удалить", "назад", "верни"
+    ]
 
     if text in start_cmds:
         return "start"
@@ -69,7 +63,15 @@ def normalize_command(text: str):
     return None
 
 
-# ---------------- FINISH ----------------
+# ---------------- START WORKOUT ----------------
+
+async def start_workout(message: Message):
+    user_id = message.from_user.id
+    workouts[user_id] = {"data": {}, "current": None}
+    await message.answer("🏋️ Тренировка начата")
+
+
+# ---------------- FINISH WORKOUT ----------------
 
 async def finish_workout(message: Message):
     user_id = message.from_user.id
@@ -120,7 +122,14 @@ async def finish_workout(message: Message):
     del workouts[user_id]
 
 
-# ---------------- VOICE ----------------
+# ---------------- START COMMAND ----------------
+
+@dp.message(CommandStart())
+async def start_handler(message: Message):
+    await start_workout(message)
+
+
+# ---------------- VOICE HANDLER ----------------
 
 @dp.message(F.voice)
 async def voice_handler(message: Message):
@@ -147,26 +156,22 @@ async def voice_handler(message: Message):
     audio.close()
     os.remove(path)
 
-    # ---------------- LOCAL COMMANDS (NO GPT) ----------------
+    # ---------------- INTENT CHECK ----------------
 
-    cmd = normalize_command(text)
+    intent = detect_intent(text)
 
     if user_id not in workouts:
-        workouts[user_id] = {
-            "data": {},
-            "current": None
-        }
+        workouts[user_id] = {"data": {}, "current": None}
 
     state = workouts[user_id]
 
-    if cmd == "start":
-        workouts[user_id] = {"data": {}, "current": None}
-        return await message.answer("🏋️ Тренировка начата")
+    if intent == "start":
+        return await start_workout(message)
 
-    if cmd == "finish":
+    if intent == "finish":
         return await finish_workout(message)
 
-    if cmd == "undo":
+    if intent == "undo":
         if state["data"]:
             last_ex = list(state["data"].keys())[-1]
             state["data"][last_ex].pop()
@@ -177,7 +182,7 @@ async def voice_handler(message: Message):
             await message.answer("↩️ Последний подход удалён")
         return
 
-    # ---------------- GPT ONLY FOR EXERCISES ----------------
+    # ---------------- GPT EXERCISE PARSING ----------------
 
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
@@ -185,7 +190,7 @@ async def voice_handler(message: Message):
             {
                 "role": "system",
                 "content": """
-You extract workout data.
+Extract workout sets.
 
 Return ONLY JSON:
 
@@ -199,7 +204,7 @@ Return ONLY JSON:
   ]
 }
 
-If no exercise found return empty list.
+If nothing found return empty list.
 """
             },
             {"role": "user", "content": text}
