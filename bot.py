@@ -15,9 +15,6 @@ from aiogram.filters import CommandStart
 from dotenv import load_dotenv
 from openai import OpenAI
 
-
-# ---------------- LOAD ENV ----------------
-
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -27,214 +24,183 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Регистрируем шрифт для русского текста в PDF
 pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
 
-# ---------------- STATE ----------------
-
+# Хранилище тренировок
 workouts = {}
 
 
-# ---------------- INTENT LAYER ----------------
-
-def detect_intent(text: str):
-    text = text.lower().strip()
-
-    start_cmds = [
-        "start", "начать", "начать тренировку", "старт",
-        "поехали", "погнали", "let's go", "go", "начинаем"
-    ]
-
-    finish_cmds = [
-        "finish", "конец", "конец тренировки", "финиш",
-        "закончить", "закончить тренировку", "стоп", "stop"
-    ]
-
-    undo_cmds = [
-        "undo", "отмена", "удалить", "назад", "верни"
-    ]
-
-    if text in start_cmds:
-        return "start"
-    if text in finish_cmds:
-        return "finish"
-    if text in undo_cmds:
-        return "undo"
-
-    return None
+@dp.message(CommandStart())
+async def start_handler(message: Message):
+    await message.answer(
+        "🏋️ Workout bot is ready!\n\n"
+        "Send me a voice message with your exercise."
+    )
 
 
-# ---------------- START WORKOUT ----------------
-
-async def start_workout(message: Message):
-    user_id = message.from_user.id
-    workouts[user_id] = {"data": {}, "current": None}
-    await message.answer("🏋️ Тренировка начата")
-
-
-# ---------------- FINISH WORKOUT ----------------
-
+@dp.message(F.text == "/finish")
 async def finish_workout(message: Message):
     user_id = message.from_user.id
 
-    if user_id not in workouts or not workouts[user_id]["data"]:
-        await message.answer("❌ Нет активной тренировки.")
+    if user_id not in workouts:
+        await message.answer("❌ No active workout.")
         return
 
-    data = workouts[user_id]["data"]
+    workout_data = workouts[user_id]["data"]
 
-    max_sets = max(len(v) for v in data.values())
+    # Максимальное количество подходов
+    max_sets = max(len(sets) for sets in workout_data.values())
 
-    table_data = [["Exercise"] + [f"Set {i+1}" for i in range(max_sets)]]
+    # Таблица
+    table_data = [["Exercise"]]
 
-    for exercise, sets in data.items():
+    for i in range(max_sets):
+        table_data[0].append(f"Set {i + 1}")
+
+    for exercise, sets in workout_data.items():
         row = [exercise]
 
-        for s in sets:
-            reps = s["reps"]
-            weight = s["weight"]
-
-            if weight:
-                row.append(f"{weight}kg × {reps}")
-            else:
-                row.append(str(reps))
+        for reps in sets:
+            row.append(str(reps))
 
         while len(row) < max_sets + 1:
             row.append("")
 
         table_data.append(row)
 
+    # PDF
     pdf_path = f"workout_{user_id}.pdf"
 
     doc = SimpleDocTemplate(pdf_path)
     table = Table(table_data)
 
-    table.setStyle(TableStyle([
+    style = TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
         ("GRID", (0, 0), (-1, -1), 1, colors.black),
         ("FONTNAME", (0, 0), (-1, -1), "DejaVu"),
-    ]))
+    ])
 
-    doc.build([table])
+    table.setStyle(style)
+    elements = [table]
 
-    await message.answer_document(FSInputFile(pdf_path))
+    doc.build(elements)
+
+    # Отправляем PDF
+    pdf_file = FSInputFile(pdf_path)
+    await message.answer_document(pdf_file)
 
     os.remove(pdf_path)
+
+    # Очищаем тренировку
     del workouts[user_id]
 
 
-# ---------------- START COMMAND ----------------
-
-@dp.message(CommandStart())
-async def start_handler(message: Message):
-    await start_workout(message)
-
-
-# ---------------- VOICE HANDLER ----------------
-
 @dp.message(F.voice)
 async def voice_handler(message: Message):
-    user_id = message.from_user.id
     voice = message.voice
 
-    file = await bot.get_file(voice.file_id)
+    file_id = voice.file_id
+    file = await bot.get_file(file_id)
+    file_path = file.file_path
 
     os.makedirs("voices", exist_ok=True)
-    path = f"voices/{voice.file_id}.ogg"
+    save_path = f"voices/{file_id}.ogg"
 
-    await bot.download_file(file.file_path, path)
+    # Скачиваем голосовое
+    await bot.download_file(file_path, save_path)
 
-    await message.answer("🎤 Processing...")
+    await message.answer("🎤 Voice received. Transcribing...")
 
-    audio = open(path, "rb")
+    # Speech-to-text
+    audio_file = open(save_path, "rb")
 
     transcription = client.audio.transcriptions.create(
         model="gpt-4o-mini-transcribe",
-        file=audio
+        file=audio_file
     )
 
     text = transcription.text
-    audio.close()
-    os.remove(path)
 
-    # ---------------- INTENT CHECK ----------------
+    audio_file.close()
+    os.remove(save_path)
 
-    intent = detect_intent(text)
-
-    if user_id not in workouts:
-        workouts[user_id] = {"data": {}, "current": None}
-
-    state = workouts[user_id]
-
-    if intent == "start":
-        return await start_workout(message)
-
-    if intent == "finish":
-        return await finish_workout(message)
-
-    if intent == "undo":
-        if state["data"]:
-            last_ex = list(state["data"].keys())[-1]
-            state["data"][last_ex].pop()
-
-            if not state["data"][last_ex]:
-                del state["data"][last_ex]
-
-            await message.answer("↩️ Последний подход удалён")
-        return
-
-    # ---------------- GPT EXERCISE PARSING ----------------
-
+    # GPT parsing
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {
                 "role": "system",
                 "content": """
-Extract workout sets.
+You extract workout data from user messages.
 
-Return ONLY JSON:
+Return ONLY valid JSON.
 
+If the user only says a number,
+exercise should be null.
+
+Format:
 {
-  "sets": [
-    {
-      "exercise": "string",
-      "reps": number,
-      "weight": number or null
-    }
-  ]
+  "exercise": "string or null",
+  "reps": number
 }
-
-If nothing found return empty list.
 """
             },
-            {"role": "user", "content": text}
+            {
+                "role": "user",
+                "content": text
+            }
         ]
     )
 
-    parsed = json.loads(response.choices[0].message.content)
+    result = response.choices[0].message.content
+    parsed = json.loads(result)
 
-    sets = parsed.get("sets", [])
+    user_id = message.from_user.id
+    exercise = parsed["exercise"]
+    reps = parsed["reps"]
 
-    for item in sets:
-        exercise = item["exercise"].lower().strip()
-        reps = item.get("reps")
-        weight = item.get("weight")
+    # Нормализация названия упражнения
+    if exercise:
+        exercise = exercise.lower().strip()
 
-        if exercise not in state["data"]:
-            state["data"][exercise] = []
+    # Создаем тренировку пользователя
+    if user_id not in workouts:
+        workouts[user_id] = {
+            "current_exercise": None,
+            "data": {}
+        }
 
-        state["data"][exercise].append({
-            "reps": reps,
-            "weight": weight
-        })
+    user_workout = workouts[user_id]
 
-        await message.answer(
-            f"🏋️ {exercise}\n"
-            f"💪 {weight}kg × {reps}"
-        )
+    # Если exercise пустой — используем текущее
+    if not exercise or str(exercise).lower() == "null":
+        exercise = user_workout["current_exercise"]
 
+    # Если пользователь сказал только число
+    if not exercise:
+        await message.answer("❌ Say an exercise first.")
+        return
 
-# ---------------- MAIN ----------------
+    # Новое упражнение
+    if exercise != user_workout["current_exercise"]:
+        user_workout["current_exercise"] = exercise
+
+        if exercise not in user_workout["data"]:
+            user_workout["data"][exercise] = []
+
+    # Добавляем подход
+    user_workout["data"][exercise].append(reps)
+
+    set_number = len(user_workout["data"][exercise])
+
+    # Ответ
+    await message.answer(
+        f"🏋️ {exercise}\n"
+        f"🔁 Set {set_number}\n"
+        f"💪 {reps} reps"
+    )
+
 
 async def main():
     await dp.start_polling(bot)
