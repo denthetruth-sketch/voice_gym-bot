@@ -34,7 +34,9 @@ async def start_handler(message: Message):
     await message.answer(
         "🏋️ Workout bot is ready!\n\n"
         "Send me a voice message with your exercise.\n"
-        "Example: «жим лежа 60кг 10 раз»"
+        "Examples:\n"
+        "  «жим лежа 60кг 10 раз»\n"
+        "  «жим лежа 60кг 20 раз, отжимания 20 раз, приседания 30кг 10 раз»"
     )
 
 
@@ -47,23 +49,16 @@ async def finish_workout(message: Message):
         return
 
     workout_data = workouts[user_id]["data"]
-
     max_sets = max(len(sets) for sets in workout_data.values())
 
-    # Заголовок таблицы
     table_data = [["Exercise"] + [f"Set {i + 1}" for i in range(max_sets)]]
 
     for exercise, sets in workout_data.items():
         row = [exercise]
         for entry in sets:
-            # entry = {"reps": 10, "weight": 60} or {"reps": 10, "weight": null}
             reps = entry["reps"]
             weight = entry["weight"]
-            if weight is not None:
-                row.append(f"{weight}kg × {reps}")
-            else:
-                row.append(str(reps))
-        # Дополняем пустыми ячейками
+            row.append(f"{weight}kg × {reps}" if weight is not None else str(reps))
         while len(row) < max_sets + 1:
             row.append("")
         table_data.append(row)
@@ -71,18 +66,14 @@ async def finish_workout(message: Message):
     pdf_path = f"workout_{user_id}.pdf"
     doc = SimpleDocTemplate(pdf_path)
     table = Table(table_data)
-
-    style = TableStyle([
+    table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
         ("GRID", (0, 0), (-1, -1), 1, colors.black),
         ("FONTNAME", (0, 0), (-1, -1), "DejaVu"),
-    ])
-    table.setStyle(style)
+    ]))
     doc.build([table])
 
-    pdf_file = FSInputFile(pdf_path)
-    await message.answer_document(pdf_file)
-
+    await message.answer_document(FSInputFile(pdf_path))
     os.remove(pdf_path)
     del workouts[user_id]
 
@@ -92,24 +83,22 @@ async def voice_handler(message: Message):
     voice = message.voice
     file_id = voice.file_id
     file = await bot.get_file(file_id)
-    file_path = file.file_path
 
     os.makedirs("voices", exist_ok=True)
     save_path = f"voices/{file_id}.ogg"
+    await bot.download_file(file.file_path, save_path)
 
-    await bot.download_file(file_path, save_path)
     await message.answer("🎤 Voice received. Transcribing...")
 
-    audio_file = open(save_path, "rb")
-    transcription = client.audio.transcriptions.create(
-        model="gpt-4o-mini-transcribe",
-        file=audio_file
-    )
+    with open(save_path, "rb") as audio_file:
+        transcription = client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=audio_file
+        )
     text = transcription.text
-    audio_file.close()
     os.remove(save_path)
 
-    # ── GPT parsing ───────────────────────────────────────────────────────────
+    # ── GPT parsing → всегда возвращает массив ────────────────────────────────
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
@@ -118,94 +107,94 @@ async def voice_handler(message: Message):
                 "content": """
 You extract workout data from user messages (Russian or English).
 
-Return ONLY valid JSON, no markdown.
+Return ONLY a valid JSON array, no markdown, no explanation.
 
-Rules:
-- "exercise": exercise name in lowercase, or null if only a number/weight was said
+Each element represents one exercise entry:
+- "exercise": exercise name in lowercase, or null if not mentioned
 - "reps": number of repetitions (integer)
 - "weight": weight in kg (number) if mentioned, otherwise null
 
-Examples:
-  "жим лежа 60кг 10 раз" → {"exercise": "жим лежа", "reps": 10, "weight": 60}
-  "присед 80 килограмм 5" → {"exercise": "присед", "reps": 5, "weight": 80}
-  "20 раз"                → {"exercise": null, "reps": 20, "weight": null}
-  "15"                    → {"exercise": null, "reps": 15, "weight": null}
-  "отжимания 20"          → {"exercise": "отжимания", "reps": 20, "weight": null}
+The user may say one or multiple exercises in a single message — return ALL of them.
 
-Format:
-{
-  "exercise": "string or null",
-  "reps": number,
-  "weight": number or null
-}
+Examples:
+
+Input: "жим лежа 60кг 10 раз"
+Output: [{"exercise": "жим лежа", "reps": 10, "weight": 60}]
+
+Input: "жим лежа 60кг 20 раз, отжимания 20 раз, приседания 30кг 10 раз"
+Output: [
+  {"exercise": "жим лежа",    "reps": 20, "weight": 60},
+  {"exercise": "отжимания",   "reps": 20, "weight": null},
+  {"exercise": "приседания",  "reps": 10, "weight": 30}
+]
+
+Input: "20 раз"
+Output: [{"exercise": null, "reps": 20, "weight": null}]
+
+Input: "присед 80кг 5, 5, 5"
+Output: [
+  {"exercise": "присед", "reps": 5, "weight": 80},
+  {"exercise": "присед", "reps": 5, "weight": 80},
+  {"exercise": "присед", "reps": 5, "weight": 80}
+]
 """
             },
-            {
-                "role": "user",
-                "content": text
-            }
+            {"role": "user", "content": text}
         ]
     )
 
-    result = response.choices[0].message.content.strip()
-    # Защита от markdown-обёрток
-    result = result.replace("```json", "").replace("```", "").strip()
-    parsed = json.loads(result)
+    raw = response.choices[0].message.content.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    entries = json.loads(raw)  # теперь всегда список
 
     user_id = message.from_user.id
-    exercise = parsed.get("exercise")
-    reps = parsed.get("reps")
-    weight = parsed.get("weight")  # float или None
 
-    if exercise:
-        exercise = exercise.lower().strip()
-
-    # Инициализируем тренировку пользователя
     if user_id not in workouts:
         workouts[user_id] = {
             "current_exercise": None,
-            "current_weight": None,   # ← запоминаем последний вес
+            "current_weight": None,
             "data": {}
         }
 
     user_workout = workouts[user_id]
+    reply_lines = []
 
-    # Если упражнение не названо — берём текущее
-    if not exercise or str(exercise).lower() == "null":
-        exercise = user_workout["current_exercise"]
+    for parsed in entries:
+        exercise = parsed.get("exercise")
+        reps = parsed.get("reps")
+        weight = parsed.get("weight")
 
-    if not exercise:
-        await message.answer("❌ Say an exercise first.")
-        return
+        if exercise:
+            exercise = exercise.lower().strip()
 
-    # Новое упражнение → обновляем current_exercise и сбрасываем вес
-    if exercise != user_workout["current_exercise"]:
-        user_workout["current_exercise"] = exercise
-        user_workout["current_weight"] = weight  # запоминаем вес нового упражнения
-        if exercise not in user_workout["data"]:
-            user_workout["data"][exercise] = []
-    else:
-        # То же упражнение:
-        # если вес не назван — используем вес предыдущего подхода
-        if weight is None:
-            weight = user_workout["current_weight"]
-        else:
-            # назвали новый вес — обновляем
+        # Если упражнение не названо — берём текущее
+        if not exercise or str(exercise).lower() == "null":
+            exercise = user_workout["current_exercise"]
+
+        if not exercise:
+            await message.answer("❌ Say an exercise first.")
+            return
+
+        # Новое упражнение
+        if exercise != user_workout["current_exercise"]:
+            user_workout["current_exercise"] = exercise
             user_workout["current_weight"] = weight
+            if exercise not in user_workout["data"]:
+                user_workout["data"][exercise] = []
+        else:
+            # То же упражнение: вес не назван → берём предыдущий
+            if weight is None:
+                weight = user_workout["current_weight"]
+            else:
+                user_workout["current_weight"] = weight
 
-    # Сохраняем подход как dict
-    entry = {"reps": reps, "weight": weight}
-    user_workout["data"][exercise].append(entry)
+        user_workout["data"][exercise].append({"reps": reps, "weight": weight})
+        set_number = len(user_workout["data"][exercise])
 
-    set_number = len(user_workout["data"][exercise])
+        weight_str = f"{weight}kg × " if weight is not None else ""
+        reply_lines.append(f"🏋️ {exercise} | Set {set_number} | 💪 {weight_str}{reps} reps")
 
-    # Формируем ответ
-    weight_str = f"{weight}kg × " if weight is not None else ""
-    await message.answer(
-        f"🏋️ {exercise}\n"
-        f"🔁 Set {set_number}\n"
-        f"💪 {weight_str}{reps} reps"
-    )
+    await message.answer("\n".join(reply_lines))
 
 
 async def main():
