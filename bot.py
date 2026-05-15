@@ -109,6 +109,8 @@ async def voice_handler(message: Message):
 
     file_path = file.file_path
 
+    os.makedirs("voices", exist_ok=True)
+
     save_path = f"voices/{file_id}.ogg"
 
     # Скачиваем голосовое
