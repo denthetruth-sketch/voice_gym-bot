@@ -28,6 +28,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
 
+# ---------------- STATE ----------------
 workouts = {}
 
 
@@ -37,17 +38,35 @@ workouts = {}
 async def start_handler(message: Message):
     await message.answer(
         "🏋️ Voice Gym Bot\n\n"
-        "How to use:\n\n"
-        "🎤 Say exercises:\n"
-        "• Bench press 60kg 10 reps\n"
-        "• Push ups 15\n"
-        "• 10 (adds to last exercise)\n\n"
-        "🎤 Voice commands:\n"
-        "• start workout\n"
-        "• finish workout\n"
-        "• undo last\n\n"
-        "📄 Send voice → get PDF workout"
+        "🎤 Команды:\n"
+        "• начать / старт / начать тренировку\n"
+        "• конец / финиш / конец тренировки\n"
+        "• отмена / удалить / назад\n\n"
+        "🎤 Примеры упражнений:\n"
+        "• жим 60 кг 10\n"
+        "• пресс 15\n"
+        "• 10 (добавится к последнему упражнению)\n\n"
+        "📄 После 'конец' будет PDF"
     )
+
+
+# ---------------- COMMAND NORMALIZER ----------------
+
+def normalize_command(text: str):
+    text = text.lower().strip()
+
+    start_cmds = ["start", "начать", "начать тренировку", "старт"]
+    finish_cmds = ["finish", "конец", "конец тренировки", "финиш", "закончить", "закончить тренировку"]
+    undo_cmds = ["undo", "отмена", "удалить", "назад"]
+
+    if text in start_cmds:
+        return "start"
+    if text in finish_cmds:
+        return "finish"
+    if text in undo_cmds:
+        return "undo"
+
+    return None
 
 
 # ---------------- FINISH ----------------
@@ -55,13 +74,13 @@ async def start_handler(message: Message):
 async def finish_workout(message: Message):
     user_id = message.from_user.id
 
-    if user_id not in workouts:
-        await message.answer("❌ No active workout.")
+    if user_id not in workouts or not workouts[user_id]["data"]:
+        await message.answer("❌ Нет активной тренировки.")
         return
 
     data = workouts[user_id]["data"]
 
-    max_sets = max((len(v) for v in data.values()), default=0)
+    max_sets = max(len(v) for v in data.values())
 
     table_data = [["Exercise"] + [f"Set {i+1}" for i in range(max_sets)]]
 
@@ -69,12 +88,13 @@ async def finish_workout(message: Message):
         row = [exercise]
 
         for s in sets:
-            if isinstance(s, dict):
-                reps = s.get("reps", "")
-                weight = s.get("weight", "")
-                row.append(f"{weight}x{reps}" if weight else str(reps))
+            reps = s["reps"]
+            weight = s["weight"]
+
+            if weight:
+                row.append(f"{weight}kg × {reps}")
             else:
-                row.append(str(s))
+                row.append(str(reps))
 
         while len(row) < max_sets + 1:
             row.append("")
@@ -124,11 +144,40 @@ async def voice_handler(message: Message):
     )
 
     text = transcription.text
-
     audio.close()
     os.remove(path)
 
-    # ---------------- GPT ----------------
+    # ---------------- LOCAL COMMANDS (NO GPT) ----------------
+
+    cmd = normalize_command(text)
+
+    if user_id not in workouts:
+        workouts[user_id] = {
+            "data": {},
+            "current": None
+        }
+
+    state = workouts[user_id]
+
+    if cmd == "start":
+        workouts[user_id] = {"data": {}, "current": None}
+        return await message.answer("🏋️ Тренировка начата")
+
+    if cmd == "finish":
+        return await finish_workout(message)
+
+    if cmd == "undo":
+        if state["data"]:
+            last_ex = list(state["data"].keys())[-1]
+            state["data"][last_ex].pop()
+
+            if not state["data"][last_ex]:
+                del state["data"][last_ex]
+
+            await message.answer("↩️ Последний подход удалён")
+        return
+
+    # ---------------- GPT ONLY FOR EXERCISES ----------------
 
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
@@ -136,15 +185,11 @@ async def voice_handler(message: Message):
             {
                 "role": "system",
                 "content": """
-You are a fitness assistant.
+You extract workout data.
 
-Return ONLY valid JSON.
+Return ONLY JSON:
 
-You may return:
-
-1) Multiple sets:
 {
-  "type": "sets",
   "sets": [
     {
       "exercise": "string",
@@ -154,11 +199,7 @@ You may return:
   ]
 }
 
-2) Command:
-{
-  "type": "command",
-  "command": "start" | "finish" | "undo"
-}
+If no exercise found return empty list.
 """
             },
             {"role": "user", "content": text}
@@ -167,41 +208,6 @@ You may return:
 
     parsed = json.loads(response.choices[0].message.content)
 
-    # ---------------- INIT ----------------
-
-    if user_id not in workouts:
-        workouts[user_id] = {
-            "current_exercise": None,
-            "data": [],
-            "history": []
-        }
-
-    state = workouts[user_id]
-
-    # ---------------- COMMANDS ----------------
-
-    if parsed["type"] == "command":
-        cmd = parsed["command"]
-
-        if cmd == "finish":
-            return await finish_workout(message)
-
-        if cmd == "start":
-            workouts[user_id] = {
-                "current_exercise": None,
-                "data": [],
-                "history": []
-            }
-            return await message.answer("🏋️ Workout started")
-
-        if cmd == "undo":
-            if state["data"]:
-                last = state["data"].pop()
-                await message.answer("↩️ Last set removed")
-            return
-
-    # ---------------- SETS ----------------
-
     sets = parsed.get("sets", [])
 
     for item in sets:
@@ -209,13 +215,13 @@ You may return:
         reps = item.get("reps")
         weight = item.get("weight")
 
-        state["data"].append({
-            "exercise": exercise,
+        if exercise not in state["data"]:
+            state["data"][exercise] = []
+
+        state["data"][exercise].append({
             "reps": reps,
             "weight": weight
         })
-
-        state["history"].append(item)
 
         await message.answer(
             f"🏋️ {exercise}\n"
