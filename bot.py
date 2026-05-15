@@ -95,6 +95,8 @@ async def finish_workout(message: Message):
 
     await message.answer_document(pdf_file)
 
+    os.remove(pdf_path)
+
     # Очищаем тренировку
     del workouts[user_id]
 
@@ -127,6 +129,10 @@ async def voice_handler(message: Message):
     )
 
     text = transcription.text
+
+    audio_file.close()
+
+    os.remove(save_path)
 
     # GPT parsing
     response = client.chat.completions.create(
