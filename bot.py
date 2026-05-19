@@ -28,7 +28,7 @@ pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
 
 workouts = {}
 
-# ── intent keywords (без GPT) ─────────────────────────────────────────────────
+# ── intent keywords ───────────────────────────────────────────────────────────
 
 START_KEYWORDS = {
     "начать", "начать тренировку", "старт", "поехали",
@@ -47,9 +47,7 @@ UNDO_KEYWORDS = {
 
 
 def detect_intent(text: str) -> str:
-    """Keyword matching — GPT не используется."""
     normalized = text.strip().lower()
-    # сортируем по длине чтобы «конец тренировки» сработал раньше чем «конец»
     for phrase in sorted(START_KEYWORDS, key=len, reverse=True):
         if phrase in normalized:
             return "start"
@@ -62,6 +60,87 @@ def detect_intent(text: str) -> str:
     return "exercise"
 
 
+# ── GPT prompt ────────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """
+You extract workout data from user messages (Russian or English).
+
+Return ONLY a valid JSON array, no markdown, no explanation.
+
+Each element represents one exercise entry:
+- "exercise": canonical exercise name in lowercase Russian/English.
+  IMPORTANT: always use the SAME canonical name for the same exercise.
+  For example "жим лежа", "жим", "жим лёжа" → always return "жим лежа".
+  Return null only if no exercise was mentioned at all (e.g. user said only a number).
+- "reps": number of repetitions (integer)
+- "weight": weight in kg (number) ONLY if explicitly mentioned by user, otherwise null.
+  If user did not say weight — return null, do NOT invent it.
+
+The user may say one or multiple exercises — return ALL of them.
+
+Examples:
+
+Input: "жим лежа 60кг 10 раз"
+Output: [{"exercise": "жим лежа", "reps": 10, "weight": 60}]
+
+Input: "жим лежа 30 раз"
+Output: [{"exercise": "жим лежа", "reps": 30, "weight": null}]
+
+Input: "жим 8 раз"
+Output: [{"exercise": "жим лежа", "reps": 8, "weight": null}]
+
+Input: "жим лежа 60кг 20 раз, отжимания 20 раз, приседания 30кг 10 раз"
+Output: [
+  {"exercise": "жим лежа",   "reps": 20, "weight": 60},
+  {"exercise": "отжимания",  "reps": 20, "weight": null},
+  {"exercise": "приседания", "reps": 10, "weight": 30}
+]
+
+Input: "20 раз"
+Output: [{"exercise": null, "reps": 20, "weight": null}]
+
+Input: "присед 80кг 5, 5, 5"
+Output: [
+  {"exercise": "присед", "reps": 5, "weight": 80},
+  {"exercise": "присед", "reps": 5, "weight": 80},
+  {"exercise": "присед", "reps": 5, "weight": 80}
+]
+"""
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def apply_entry(user_workout: dict, exercise: str, reps: int, weight) -> tuple[int, any]:
+    """
+    Добавляет подход в тренировку с правильной логикой веса.
+    Возвращает (set_number, weight_использованный).
+    """
+    current_ex = user_workout["current_exercise"]
+
+    if exercise != current_ex:
+        # ── новое упражнение ──────────────────────────────────────────────────
+        user_workout["current_exercise"] = exercise
+        # вес: берём из сообщения, если не сказан — сбрасываем (новое упражнение)
+        user_workout["current_weight"] = weight
+        if exercise not in user_workout["data"]:
+            user_workout["data"][exercise] = []
+    else:
+        # ── то же упражнение ──────────────────────────────────────────────────
+        if weight is None:
+            # вес не назван → берём предыдущий
+            weight = user_workout["current_weight"]
+        else:
+            # назван новый вес → обновляем
+            user_workout["current_weight"] = weight
+
+    entry = {"reps": reps, "weight": weight}
+    user_workout["data"][exercise].append(entry)
+    user_workout["history"].append((exercise, entry))
+
+    set_number = len(user_workout["data"][exercise])
+    return set_number, weight
+
+
 # ── handlers ──────────────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
@@ -71,19 +150,20 @@ async def start_handler(message: Message):
         "current_exercise": None,
         "current_weight": None,
         "data": {},
-        "history": []   # для undo: список (exercise, entry)
+        "history": []
     }
     await message.answer(
         "🏋️ <b>Тренировка начата!</b>\n\n"
         "Отправляй голосовые сообщения с упражнениями.\n\n"
         "<b>Примеры:</b>\n"
         "  • «жим лежа 60кг 10 раз»\n"
+        "  • «жим лежа 30 раз» — второй подход, вес подтянется автоматически\n"
         "  • «присед 80кг 5, пресс 20, отжимания 15»\n\n"
         "<b>Голосовые команды:</b>\n"
         "  • <b>Старт</b> / поехали / начать — начать тренировку\n"
         "  • <b>Финиш</b> / конец / стоп — завершить и получить PDF\n"
         "  • <b>Отменить</b> / удалить / убрать — удалить последний подход\n\n"
-        "<b>Команды:</b>\n"
+        "<b>Текстовые команды:</b>\n"
         "  /finish — завершить тренировку\n"
         "  /undo — удалить последний подход",
         parse_mode="HTML"
@@ -141,20 +221,16 @@ async def undo_last(message: Message):
         await message.answer("❌ Нечего отменять.")
         return
 
-    # достаём последнюю запись
     exercise, entry = history.pop()
     sets = workouts[user_id]["data"].get(exercise, [])
 
-    # удаляем последнее совпадающее вхождение
     for i in range(len(sets) - 1, -1, -1):
         if sets[i] == entry:
             sets.pop(i)
             break
 
-    # если подходов не осталось — убираем упражнение
     if not sets:
         del workouts[user_id]["data"][exercise]
-        # сбрасываем current_exercise если он был этим упражнением
         if workouts[user_id]["current_exercise"] == exercise:
             workouts[user_id]["current_exercise"] = None
             workouts[user_id]["current_weight"] = None
@@ -200,7 +276,7 @@ async def voice_handler(message: Message):
     text = transcription.text
     os.remove(save_path)
 
-    # ── сначала проверяем intent — GPT не нужен ───────────────────────────────
+    # ── intent без GPT ────────────────────────────────────────────────────────
     intent = detect_intent(text)
 
     if intent == "start":
@@ -215,55 +291,22 @@ async def voice_handler(message: Message):
         await undo_last(message)
         return
 
-    # ── упражнение → GPT ──────────────────────────────────────────────────────
-    if message.from_user.id not in workouts:
+    # ── проверяем что тренировка начата ───────────────────────────────────────
+    user_id = message.from_user.id
+
+    if user_id not in workouts:
         await message.answer(
             "⚠️ Тренировка не начата.\n"
             "Скажи «начать» или отправь /start."
         )
         return
 
+    # ── GPT парсинг упражнений ────────────────────────────────────────────────
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
-            {
-                "role": "system",
-                "content": """
-You extract workout data from user messages (Russian or English).
-
-Return ONLY a valid JSON array, no markdown, no explanation.
-
-Each element represents one exercise entry:
-- "exercise": exercise name in lowercase, or null if not mentioned
-- "reps": number of repetitions (integer)
-- "weight": weight in kg (number) if mentioned, otherwise null
-
-The user may say one or multiple exercises in a single message — return ALL of them.
-
-Examples:
-
-Input: "жим лежа 60кг 10 раз"
-Output: [{"exercise": "жим лежа", "reps": 10, "weight": 60}]
-
-Input: "жим лежа 60кг 20 раз, отжимания 20 раз, приседания 30кг 10 раз"
-Output: [
-  {"exercise": "жим лежа",    "reps": 20, "weight": 60},
-  {"exercise": "отжимания",   "reps": 20, "weight": null},
-  {"exercise": "приседания",  "reps": 10, "weight": 30}
-]
-
-Input: "20 раз"
-Output: [{"exercise": null, "reps": 20, "weight": null}]
-
-Input: "присед 80кг 5, 5, 5"
-Output: [
-  {"exercise": "присед", "reps": 5, "weight": 80},
-  {"exercise": "присед", "reps": 5, "weight": 80},
-  {"exercise": "присед", "reps": 5, "weight": 80}
-]
-"""
-            },
-            {"role": "user", "content": text}
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": text}
         ]
     )
 
@@ -271,7 +314,6 @@ Output: [
     raw = raw.replace("```json", "").replace("```", "").strip()
     entries = json.loads(raw)
 
-    user_id = message.from_user.id
     user_workout = workouts[user_id]
     reply_lines = []
 
@@ -283,30 +325,17 @@ Output: [
         if exercise:
             exercise = exercise.lower().strip()
 
-        if not exercise or str(exercise).lower() == "null":
+        # упражнение не названо → берём текущее
+        if not exercise or exercise == "null":
             exercise = user_workout["current_exercise"]
 
         if not exercise:
             await message.answer("❌ Сначала назови упражнение.")
             return
 
-        if exercise != user_workout["current_exercise"]:
-            user_workout["current_exercise"] = exercise
-            user_workout["current_weight"] = weight
-            if exercise not in user_workout["data"]:
-                user_workout["data"][exercise] = []
-        else:
-            if weight is None:
-                weight = user_workout["current_weight"]
-            else:
-                user_workout["current_weight"] = weight
+        set_number, used_weight = apply_entry(user_workout, exercise, reps, weight)
 
-        entry = {"reps": reps, "weight": weight}
-        user_workout["data"][exercise].append(entry)
-        user_workout["history"].append((exercise, entry))  # для undo
-
-        set_number = len(user_workout["data"][exercise])
-        weight_str = f"{weight}kg × " if weight is not None else ""
+        weight_str = f"{used_weight}kg × " if used_weight is not None else ""
         reply_lines.append(
             f"🏋️ {exercise} | Set {set_number} | 💪 {weight_str}{reps} reps"
         )
