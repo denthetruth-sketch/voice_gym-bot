@@ -364,7 +364,7 @@ async def action_undo(message: Message) -> None:
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+        f"👋 <b>Привет!, {message.from_user.first_name}!</b>\n\n"
         "Я помогу тебе вести тренировки голосом.\n\n"
         "<b>Как это работает:</b>\n"
         "  1️⃣ Нажми «Начать тренировку»\n"
